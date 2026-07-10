@@ -1,0 +1,5 @@
+# Metadata consumed by the build workflow to construct the build matrix.
+# `image`   -> last path segment of the published image name
+# `version` -> primary image tag (keep in sync with the Dockerfile base)
+image: example
+version: "1.27.3"

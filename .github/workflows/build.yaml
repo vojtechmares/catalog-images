@@ -1,0 +1,90 @@
+# Build, sign and scan changed images.
+#
+# `discover` finds image directories (those containing a Dockerfile) that
+# changed, then fans them out to the reusable image-build workflow in
+# catalog-ci. On pull requests images are built but not pushed.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      any: ${{ steps.set.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build image matrix
+        id: set
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # List directories that contain a Dockerfile.
+          all_dirs="$(find . -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' | sed 's|^\./||' | sort -u)"
+
+          # Determine which of them changed. If we have no usable base ref
+          # (first push / manual run), build everything.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] || \
+             [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            changed_dirs="$all_dirs"
+          else
+            changed_files="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+            changed_dirs="$(echo "$changed_files" | cut -d/ -f1 | sort -u)"
+          fi
+
+          matrix='[]'
+          for dir in $all_dirs; do
+            echo "$changed_dirs" | grep -qx "$dir" || continue
+            [ -f "$dir/metadata.yaml" ] || { echo "::warning::$dir has no metadata.yaml, skipping"; continue; }
+            image="$(yq '.image' "$dir/metadata.yaml")"
+            version="$(yq '.version' "$dir/metadata.yaml")"
+            entry="$(jq -nc --arg image "$image" --arg context "$dir" --arg version "$version" \
+              '{image: $image, context: $context, version: $version}')"
+            matrix="$(jq -c ". += [$entry]" <<< "$matrix")"
+          done
+
+          if [ "$(jq 'length' <<< "$matrix")" -gt 0 ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $matrix"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.any == 'true'
+    permissions:
+      contents: read
+      id-token: write # cosign keyless signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+    uses: vojtechmares/catalog-ci/.github/workflows/reusable-image-build.yaml@main
+    with:
+      image: ${{ matrix.image }}
+      context: ${{ matrix.context }}
+      version: ${{ matrix.version }}
+      registry: registry.mareshq.com
+      image-repo: catalog/images
+      push: ${{ github.event_name != 'pull_request' }}
+    secrets:
+      registry-username: ${{ secrets.REGISTRY_USERNAME }}
+      registry-password: ${{ secrets.REGISTRY_PASSWORD }}
